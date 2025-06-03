@@ -1,0 +1,257 @@
+#!/bin/bash
+sname=`basename $0`
+#[ $# -eq 0 ] && { echo "Use: ${sname}  -h|--help"; exit 1 ; }
+declare -ir false=0 true=1 2>/dev/null
+#-------------------------------------------------------------------
+sec2dhms() {
+   date -ud "@$1" "+$(($1/86400))-%H:%M:%S";
+}
+#-------------------------------------------------------------------
+is_number() {
+	var=$1
+	if [ -n "$var" ] && [ "$var" -eq "$var" ] 2>/dev/null; then
+		true
+        else
+		false
+        fi
+}
+#-------------------------------------------------------------------
+set_time() {
+	d=$1
+	( ! is_number $d ) && echo $d && return
+	echo `date +%F --date="-$d day"`
+}
+#-------------------------------------------------------------------
+printc() {
+	[ $# -eq 0 ] && { echo "Usage: ${FUNCNAME[0]}  <string> <number>"; return ; }
+	local str num v
+	str=$1
+	num=$2
+	v=$(printf "%-${num}s" "$str")
+	echo "${v// /$str}"
+#	echo $(yes $str | head -n${num})  | tr -d ' '
+}
+#-------------------------------------------------------------------
+m_by_gh() {
+        [ $# -eq 0 ] && { echo "Usage: ${FUNCNAME[0]} <number>"; return ; }
+        local out
+        out=`echo "scale=0 ; ($1*$CpuGH + 0.5)/1.0" | bc`
+        echo $out
+}
+#-------------------------------------------------------------------
+memG() {
+	local M=$1 U
+	U=${M: -1} ; U=${U^}
+	M=${M::-1}
+	if [ "$U" == "K" ]; then
+	   M=`echo "scale=2; $M/1024/1024" | bc -l`
+	elif [ "$U" == "M" ]; then
+	   M=`echo "scale=2; $M/1024" | bc -l`
+	fi
+	echo $M
+}
+#-------------------------------------------------------------------
+function data_proc(){
+   local FMT OPT nc mem T bill cput=0 memt=0 Bilt=0
+   local TT=0 TM=0 Umem=0 Ucpu=0 Acpu Amem AcpuE AmemE
+   FMT="JOBID,AllocCPUS,reqmem,ElapsedRaw,AllocTRES%50"
+   OPT="-n -u $user $ACT $SJID $STATE $delt -o $FMT"
+   tmpf=`mktemp -p /dev/shm sacct_XXX.txt`
+   outf=`mktemp -p /dev/shm mem_cpu_XXX`
+   sacct $OPT | awk '$1 ~ /^[[:digit:]]+$/'> $tmpf
+
+   Nj=`cat $tmpf | wc -l `
+   echo " cpu_ef%  mem_ef%  Billing "  >$outf
+   echo " -------  -------  --------" >>$outf
+   while read id nc mem T bill; do
+      bill=`echo $bill | awk -F, '{print $1}' | awk -F= '{print $2}'`
+      bill=$((bill*T/3600))
+      if [ "${mem: -1}" == "M" ]; then
+	 mem=$((${mem::-1}/1024))
+      else
+	 mem=${mem::-1}
+      fi
+      mem=${mem%.*}
+      TT=$((TT+T))
+      TM=`echo $TM $mem | awk '{print $1+$2}'`
+      cput=$((cput + nc*T))
+      memt=$((memt + mem*T))
+      Bilt=$((Bilt + bill))
+
+      cpu_ef=`seff $id | grep "CPU Efficiency" | awk '{print $3}'`
+      mem_ef=`seff $id | grep "Memory Efficiency" | awk '{print $3}'`
+      cpu_ef=${cpu_ef::-1} 
+      mem_ef=${mem_ef::-1}
+
+      Umem=`echo $Umem $mem_ef $mem | awk '{printf("%.2f\n", $1+$2*$3/100)}'`
+      Ucpu=`echo $Ucpu $cpu_ef $nc $T | awk '{printf("%.2f\n", $1+$2*$3*$4/100)}'`
+
+      printf "%6.2f   %6.2f %8d\n" $cpu_ef $mem_ef $bill >> $outf 
+
+
+   done<$tmpf 
+   cpuT=$((cput/3600))
+   memT=$((memt/3600))
+
+   Acpu=$((cput/TT))
+   Amem=$((memt/TT))
+
+   AcpuE=`echo $Ucpu $cput | awk '{printf("%.2f\n", $1*100/$2)}'`
+   AmemE=`echo $Umem $TM   | awk '{printf("%.2f\n", $1*100/$2)}'`
+
+   paste -d ' ' $file $outf
+   printc = 35
+
+   TT=`eval "echo $(date -ud "@$TT" +'$((%s/3600/24))-%H:%M')"`
+   echo " Total Number of Jobs    = $Nj"
+   echo " Total CPU*Hours         = $cpuT"
+   echo " Total Memory*Hours      = $memT"
+   echo " Total Billing           = $Bilt"
+   echo ""
+   echo " Total Wall-clock time   = $TT" 
+   echo " Average number of Cores = $Acpu"
+   echo " Average Memory          = ${Amem}GB"
+   echo ""
+   echo " CPU Efficiency          = ${AcpuE}%"  
+   echo " Memory Efficiency       = ${AmemE}%"  
+   printc = 35
+
+   rm -fr $tmpf $outf
+}
+#-------------------------------------------------------------------
+Header=true
+Accoun=""
+detail=false
+Grp=true
+CpuGH=1.0
+TRES="Billing"
+while [[ $# -gt 0 ]]; do
+	key="$1"
+	case $key in
+		-e|--end)
+			time2=$(set_time $2)
+			shift 2
+			;;
+		-s|--start)
+			time1=$(set_time $2)
+			shift 2
+			;;
+		-u|--user)
+			user=$2
+			nu=$(echo $2 |tr ',' '\n' | wc -l)
+			shift 2
+			;;
+		-a|--account)
+			ACT="-A $2"
+			shift 2
+			;;
+		-j|--jobs)
+			SJID="-j $2"
+			shift 2
+			;;
+		-S|--state)
+			STATE="-s $2"
+			shift 2
+			;;
+		-c|--cluster)
+			cluster_name=$2
+			shift 2
+			;;
+		-o|--format)
+			FMT=$2
+			shift 2
+			;;
+		-h|--help)
+			echo "Usage: $sname -u <user> -s <Stime> -e <Etime> [-S <JobState>]"
+			echo "       [-a <account>] [-o <format>] [-j <JobIDs>] [--sa] [--sd]"
+			echo ""
+			echo " -N for start or end time means: N days ago"
+			echo " --sa Show account name"
+			echo " --sd Show details"
+			echo "Defaults: "
+			echo "  user   = \$USER"
+			echo "  Stime  = One month ago "
+			echo "  Etime  = now"
+			echo "  format = JOBID%7,Part,NNodes%3,AllocCPUS%4,Reqmem,Elapsed%13,State%9"
+			echo "  use 'sacct --helpformat' for available format fields"
+
+			exit
+			;;
+                -gh)
+                        CpuGH=$2 ; CGH="*GH"
+                        shift 2
+			;;
+		--sa)
+			Accoun=",Account"
+			shift
+			;;
+		--sd)
+			detail=true
+			shift
+			;;
+		*)
+			echo "\"$1\" is not a valid argument"
+			echo "Try '${scname} -h|--help' for more information "
+			exit
+			;;
+	esac
+done
+#=========================================================================
+[ -z $user ] && user=$USER
+home_dir=`grep ^$user /etc/passwd | awk -F: '{print $6}'`
+Birth_date=`stat $home_dir | grep Birth | awk '{print $2}'`
+[ -z $time1 ] && time1=$Birth_date
+[ -z $time2 ] && time2=now
+
+file=`mktemp -p /dev/shm sacct_XXX.txt`
+delt="-S $time1 -E $time2"
+#JIDS=(`sacct -u $USER $delt -n -o JOBID,MAXRSS | grep -v ".batch\|.extern"`)
+FMT1="JOBID%7,Part%7${Accoun},NNodes%3,AllocCPUS%4,reqmem,elapsed%12,State%9,JobName%15"
+[ -z $FMT ] && FMT="$FMT1" || true
+OPT="-u $user $ACT $SJID $STATE $delt -o $FMT"
+sacct $OPT | awk 'FNR<=3 || $1 ~ /^[[:digit:]]+$/' | sed -e 's/Allo/Ncpu/' > $file
+echo ""
+if ($detail); then
+	data_proc
+else
+	cat $file
+fi
+rm -fr $file
+exit
+file=`mktemp`
+Lin2=`sed -n '2{p;q;}' $file`
+Lin3=`sed -n '3{p;q;}' $file`
+
+if ( $Header ); then
+	printc = 75
+	echo $Lin2 ; echo $Lin3
+	echo "TRES type is $TRES"
+	printc - 75
+	printf "%-20s %-40s  %12s\n" "User " "Account" "Usage"
+	printc = 75
+fi
+
+data=(`tail -n +6 $file | sort | sed 's/, /,/g' |tr -d '\n' | sed 's/|/ /g'`)
+($Grp) && data=(`tail -n +6 $file | sed 's/, /,/g' |tr -d '\n' | sed 's/|/ /g'`)
+rm -fr $file
+
+ndat=${#data[@]}
+usage=0 ; sumus=0
+for i in $(seq 1 3 $ndat); do
+	j=$((i-1))
+	k=$((i+1))
+	usage=`m_by_gh ${data[$k]}`
+	sumus=$(( sumus + usage ))
+	length=${#data[$i]}
+	if ( $Accoun ); then
+		echo ${data[$j]} ${data[$i]} $usage\
+		       	| awk '{printf("%-20s %-40s %12.0f\n", $1,$2,$3)}'
+	else
+		echo ${data[$j]} $usage\
+		       	| awk '{printf("%-20s %12.0f\n", $1,$2)}'
+
+	fi
+done
+( $Header ) && 	printc - 75
+( $prisum && $Accoun ) && printf "%-20s %53d\n" "Total" $sumus
+( $prisum && !($Accoun) ) && printf "%-20s %12d\n" "Total" $sumus
