@@ -1,0 +1,166 @@
+#!/bin/bash
+sname=`basename "$0"`
+#----------------------------------------------------------------
+function Usage(){
+	local ID=65327
+        echo ""
+        echo "Usage: ${sname} <JobID> <[+]Time>"
+        echo ""
+        echo "For example, if your JobID is $ID, you can:"
+	echo " "
+	echo "* Add 2 hours to the execution time by:  ${sname} $ID +120"
+	echo "* Add 1 day to the execution time by  :  ${sname} $ID +1-0"
+	echo "* Change the execution time to 4 days :  ${sname} $ID 4-0"
+        echo ""
+        exit
+}
+#----------------------------------------------------------------
+#_USER=${_USER:=$USER}
+[ $# -lt 2 ] && Usage || true
+JID=$1
+time=$2
+_CHECK=1
+#----------------------------------------------------------------
+is_uint() { case $1        in '' | *[!0-9]*  ) return 1;; esac ;}
+is_int()  { case ${1#[-+]} in '' | *[!0-9]*  ) return 1;; esac ;}
+#----------------------------------------------------------------
+function to_minutes() {
+    local Time="$1"
+    local days=0 hours=0 minutes=0 seconds=0 Sign
+    if ( ! is_int ${Time//[-+:]/} ); then
+       echo "$Time is not a valid time format"
+       exit 1
+    fi
+
+    Sign=${Time::1}
+    [[ "$Sign" == "+"  || "$Sign" == "-" ]] && Time=${Time: 1} && SGN=$Sign
+    [[ "$Sign" == "-" ]] && _CHECK=0
+
+    # Extract days if format contains '-'
+    if [[ "$Time" =~ ([0-9]+)- ]]; then
+        days="${BASH_REMATCH[1]}"
+        Time="${Time#*-}"  # Remove days from input
+    fi
+
+    # Check if Time contains `:` (to differentiate minutes-only input)
+    if [[ "$Time" == *:* ]]; then
+        IFS=':' read -r hours minutes seconds <<< "$Time"
+    else
+        minutes="$Time"  # If no `:`, assume input is minutes!
+    fi
+
+    # Ensure non-empty values default to zero
+    minutes=${minutes:-0}
+    hours=${hours:-0}
+    seconds=${seconds:-0}
+
+    # Convert all values to total minutes
+    total_minutes=$((days*1440 + hours*60 + minutes + (seconds > 0 ? 1 : 0))) 
+
+    echo "${SGN}${total_minutes}"
+}
+#----------------------------------------------------------------
+function jobs_usage(){
+   local Acct=$1 id St list FMT IDs ETime TTime Bill UF BUT
+   SumJC=0
+   FMT="ElapsedRaw,TimelimitRaw,AllocTRES"
+   IDs=(`squeue -A $Acct --me -t R -hO JobID`)
+
+   for id in ${IDs[@]}; do
+      list=(`sacct -nXP --format=$FMT -j $id | sed 's/|/ /g'`)
+      ETime=$((list/60 + 1))
+      TTime=${list[1]}
+      UF=`UsageFactor $id`
+      Bill=`echo ${list[2]} | awk -F, '{print $1}' | awk -F= '{print $2}'`
+      TTIME=$((TTime-ETime))
+      BUT=`awk '{printf"%.0f\n",$1*$2*$3}' <<< "$Bill $UF $TTIME"`
+      SumJC=$((BUT + SumJC))
+   done
+}
+#----------------------------------------------------------------
+function remain_credit(){
+   local ACCTS Acc g u rem
+   credfile=`mktemp -u -p /dev/shm`
+   ACCTS=(`sacctmgr -n show assoc tree format=account user=$USER`)
+   for Acc in ${ACCTS[@]}; do
+      read -r g u <<<$(sshare -nU -u $USER -A $Acc -o GrpTRESMins,RawUsage)
+      g=`echo $g | awk -F= '{print $2}'`
+      u=$((u/60))
+      jobs_usage $Acc
+      rem=$((g-u-SumJC))
+      echo "$Acc $rem" >> $credfile
+   done
+}
+#----------------------------------------------------------------
+function UsageFactor() {
+   local uf ID=$1 jqos
+   jqos=$(squeue -hj $ID -O qos)
+   [ -z "$jqos" ] && jqos=normal || true
+   uf=$(sacctmgr -nP show qos $jqos Format=UsageFactor)
+   echo $uf
+}
+#----------------------------------------------------------------
+function check_credit(){
+   [ $_CHECK -eq 0 ] && { Allow=1; return; } || true
+   local St list FMT ID=$1 ACCT TTime Bill ReqC RemC Diff UF
+   St=`squeue -j $ID -ho "%t"`
+   if [ "St" == "R" ]; then
+      FMT="Account,TimelimitRaw,AllocTRES"
+   else
+      FMT="Account,TimelimitRaw,ReqTRES"
+   fi
+   list=(`sacct -nXP --format=$FMT -j $ID | sed 's/|/ /g'`)
+   ACCT=$list
+   TTime=${list[1]}
+   Bill=`echo ${list[2]} | awk -F, '{print $1}' | awk -F= '{print $2}'`
+   UF=`UsageFactor $ID`
+
+   [ "${Time::1}" != "+" ] && Time=$((Time-TTime)) || true
+   ReqC=`awk '{printf"%.0f\n",$1*$2*$3}' <<< "$Bill $UF $Time"`
+   RemC=`grep $ACCT $credfile | tail -1 | awk '{print $2}'`
+   Diff=$((RemC - ReqC))
+   if [ $Diff -ge 0 ]; then
+      Allow=1
+      RemC=$((RemC - $ReqC))
+      [ "$St" == "R" ] && echo "$ACCT $RemC" >> $credfile || true
+   else
+      Allow=0
+   fi
+}
+#----------------------------------------------------------------
+function check_part_limit(){
+   [ $_CHECK -eq 0 ] && { Allow=1; return; } || true
+   local jid=$1 Sign=${Time::1} T1 T2
+   part=$(squeue -hj $jid -o "%P")
+   maxtime=$(scontrol show part $part | grep -o "MaxTime=[^ ]*" | cut -d'=' -f2)
+   MaxTime=$(to_minutes $maxtime)
+   T1=$(sacct -nXP -o TimeLimitRaw -j $jid)
+   [[ "$Sign" == "+" ]] && T2=$((T1+Time)) || T2=$Time
+   [[ $T2 -gt $MaxTime ]] && Allow=0 || Allow=1
+}
+#----------------------------------------------------------------
+# scontrol show job 43808 | awk -F= '/AllocTRES/  {print $NF}'
+#----------------------------------------------------------------
+Time=$(to_minutes $time)
+remain_credit
+IDs=(`echo $JID | sed 's/,/ /g'`)
+[ "${JID^^}" == "ALL" ] && IDs=(`squeue --me -ho %i`) || true
+for i in ${IDs[@]}; do
+    squeue -h --me -o %i | grep $i > /dev/null
+    [ $? -ne 0 ] && { echo "$i is not your JobID" ; continue;} || true
+    check_part_limit $i
+    if [ $Allow -eq 0 ]; then
+       echo "The time of your job cannot be updated."
+       echo "The MaxTime limit for the '"$part"' partition is $maxtime."
+       continue
+    fi
+    check_credit $i
+    if [ $Allow -eq 1 ]; then
+       sudo sujt $i $Time
+       Allow=0
+    else
+       echo "$i : Your credit is not enough to change the time of this job"
+    fi
+done
+rm -fr $credfile
+
