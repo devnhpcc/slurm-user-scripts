@@ -1,0 +1,98 @@
+#!/bin/bash
+#==========================================================
+is_uint() { case $1 in '' | *[!0-9]* ) return 1;; esac ;}
+#==========================================================
+unset SLURM_TIME_FORMAT
+args=($@)
+st=0
+for arg in "$@"; do
+    [ "$arg" == "-t" ] && st=1
+done
+#----------------------------------------------------------
+if ( is_uint $1 ); then
+    user=$1
+    n=${#user}
+    UU="u111111"
+    [ $n -ne 0 ] && user=${UU:: -n}$user
+    args=(-u $user ${args[@]:1})
+fi
+#----------------------------------------------------------
+if ( groups | grep -wq hpc_admins ); then
+    FL2=username  ; me=""      ; HEAD=USER
+else
+    FL2=partition ; me="--me"  ; HEAD=PART
+fi
+
+OPT="${args[@]} $me -S i"
+
+# Define column formatting for squeue
+FMTR="JobArrayID:12,${FL2}:12,Name:99,StateCompact:3,tres-alloc:50,TimeUsed:12,TimeLeft:12,ReasonList:30"
+FMTP="JobArrayID:12,${FL2}:12,Name:99,StateCompact:3,tres-alloc:50,SubmitTime:20,TimeLeft:12,ReasonList:30"
+
+process_squeue(){
+local ST=$1 FORMAT=$2
+# Run squeue and process output
+squeue $OPT -ht $ST -O $FORMAT | awk '
+function format_time(time) {
+    if (index(time, "T") > 0) {
+        split(time, dateTime, "T");
+        split(dateTime[1], dateParts, "-");
+        split(dateTime[2], timeParts, ":");
+        return dateParts[2] "-" dateParts[3] "T" timeParts[1];
+    }
+    if (index(time, "-") > 0) {
+        split(time, parts, "-");
+        split(parts[2], time_part, ":");
+        return parts[1] "-" time_part[1] ":" time_part[2];
+    }
+    return time;
+}
+
+function truncate(s,ls) {
+    gsub(/ /, "", s);
+    return substr(s, 1, ls);
+}
+
+{
+    # Find the correct field for CPU allocation (starts with "cpu=")
+    for (i = 5; i <= NF; i++) {
+        if (index($i, "cpu=") > 0) {
+            N = i;
+            break;
+        }
+    }
+
+    # Extract values dynamically
+    node=cpu=mem=gpu="0";
+    split($N, fields, ",");
+    for (i in fields) {
+        split(fields[i], kv, "=");
+        if (kv[1] == "node") node=kv[2];
+        if (kv[1] == "cpu") cpu=kv[2];
+        if (kv[1] == "mem") mem=kv[2];
+        if (kv[1] == "gres/gpu") gpu=kv[2];
+    }
+
+    # Extract time fields dynamically
+    time_used = format_time($(N+1));
+    time_left = format_time($(N+2));
+    ST = $(N-1)
+
+    # Extract job name from `$3 ... $N-2` (handles spaces properly)
+    job_name = $3;
+    for (i = 4; i <= N-2; i++) {
+        job_name = job_name $i;
+    }
+
+    name = truncate(job_name,10);
+
+    if ($NF == "(AssocGrpBillingMinutes)") $NF = "(Deficient Credit)";
+
+    # Print formatted output
+    printf "%-10s %-8s %-10s %-3s %-3s %-3s %-5s %-3s %-10s %-9s %-10s\n", $1, $2, name, ST, node, cpu, mem, gpu, time_used, time_left, $NF;
+}
+'
+}
+printf "%-10s %-8s %-10s %-3s %-3s %-3s %-5s %-3s %-10s %-9s %-20s\n" "JOBID" "$HEAD" "NAME" "ST" "NOD" "CPU" "MEM" "GPU" "(SUB_)TIME" "TIME_LEFT" "NODELIST(REASON)";
+process_squeue R $FMTR
+process_squeue PD $FMTP
