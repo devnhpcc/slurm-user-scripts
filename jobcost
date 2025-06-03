@@ -1,0 +1,84 @@
+#!/bin/bash
+sname=`basename $0`
+if [ $# -eq 0 ]; then
+   echo "  Usage: $sname <JobID>"
+   echo "    Displays the cost of running or pending jobs."
+   exit
+fi
+ID=$1
+#====================================================================
+# Function to convert time to hours
+function time_to_hours(){
+   local time=$1
+   echo $time | awk -F '[-:]' '{
+        if (NF == 4) {
+            print $1*24 + $2 + $3/60 + $4/3600
+        } else if (NF == 3) {
+            print $1 + $2/60 + $3/3600
+	} else if (NF == 2) {
+          print $1/60 + $2/3600
+        } else { print $1/3600 }}'
+}
+#====================================================================
+function job_cost(){
+   local JID=$1 FMT Bill Qos UF Time data TH DBIL BILL
+   [ $# -eq 1 ] && FMT="%q %L" || FMT="%q %l"
+   Bill=$(scontrol show job $JID | grep -m1 -oP 'billing=\K\d+')
+   data=(`squeue -hj $JID -o "$FMT"`)
+   Qos=${data[0]} ; Time=${data[1]}
+   TH=$(time_to_hours $Time)
+   UF=`sacctmgr show -Pn qos $Qos format=usagefactor`
+   BILL=$(echo $Bill $TH | awk '{printf"%.0f\n", $1*$2}')
+   DBIL=$(echo $Bill $TH $UF | awk '{printf"%.0f\n", $1*$2*$3}')
+   [ $# -eq 1 ] && { echo $DBIL ; return; }
+   echo "Job Cost          = $BILL Toman"
+   echo "Account Deduction = $DBIL Toman"
+   exit
+}
+#====================================================================
+function remain_credit(){
+    local a=$1 g u gtm remain
+    read -r g u <<<$(sshare -nU -u $user -A $a -o GrpTRESMins,RawUsage)
+    if [ -z "$u" ]; then
+        remain="Unlimited"
+    else
+        gtm=`echo $g | awk -F= '{printf "%d",  $2/60}'`
+	remain=`echo $gtm $u | awk '{printf "%d",$1 - $2/3600}'`
+    fi
+    echo $remain
+}
+#====================================================================
+# Get the user 
+user=(`squeue -hj $ID -o "%u %t %a"`)
+[ $? -ne 0 ] && exit || true
+
+[[ "${user[1]}" = R ]] && job_cost $ID R || true
+ACCT=${user[2]}
+user=${user[0]}
+
+# Get the cost of the pending job
+PD_BILL=$(job_cost $ID)
+
+# Initialize total billing for running jobs
+T_R_BILL=0
+
+# Loop through each running job and calculate the billing TRES 
+# multiplied by remaining time and QOS usage factor
+for JOB_ID in $(squeue -u $user -A $ACCT -t R -h -o %i); do
+	R_BILL=$(job_cost $JOB_ID)
+	T_R_BILL=$((T_R_BILL + R_BILL))
+done
+
+# Calculate the total billing TRES required
+TBR=$((PD_BILL+T_R_BILL))
+
+CAC=$(remain_credit $ACCT)
+
+echo "    Current available credit          =   " $CAC
+if [ $T_R_BILL -ne 0 ] && [ "$CAC" != "Unlimited" ]; then 
+   RMC=$((CAC-T_R_BILL))
+   echo "    Credit needed for running jobs    =   " $T_R_BILL
+   echo "    Remaining credit                  =   " $RMC
+fi
+echo "    Credit required to run this job   =   " $PD_BILL
+
