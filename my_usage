@@ -1,0 +1,144 @@
+#!/bin/bash
+#locale
+export LC_NUMERIC="en_US.UTF-8"
+#======================================================================
+is_uint() { case $1 in '' | *[!0-9]* ) return 1;; esac ;}
+#======================================================================
+function compute(){
+    local a=$1 g u
+    read -r g u <<<$(sshare -nU -u $USER -A $a -o GrpTRESMins,RawUsage)
+    if [ -z $u ]; then
+        usage=$((g/3600))
+        gtm="Unlimited"
+    else
+        gtm=`echo $g | awk -F= '{printf "%d",  $2/60}'`
+        usage=$((u/3600))
+        [ $gtm -ne 0 ] && u=`echo $usage $gtm | awk '{printf "%.2f", 100*$1/$2}'` || u="0"
+        perc="($u%)"
+    fi
+}
+#======================================================================
+printc() {
+    [ $# -eq 0 ] && { echo "Usage: ${FUNCNAME[0]}  <string> <number>"; return ; }
+    local str num v
+    str=$1
+    num=$2
+    v=$(printf "%-${num}s" "$str")
+    echo "${v// /$str}"
+}
+#======================================================================
+function total_usage(){
+    local time1 Part OPT n=0
+    time1="2022-10-01"
+    OPT="-n -t Hours  job SizesByAccount start=$time1 end=now users=$USER"
+    Part=(`sinfo -h -o "%R"`) ; Part+=(_TOT)
+
+    echo ""
+    printf "%-10s %-12s %-12s %10s\n" "Partition" "CPU*Hours" "Mem(GB)*Hours" "Billing"
+    printc = 50
+    
+    for P in ${Part[@]}; do
+        if [ "$P" == "_TOT" ]; then
+            PART="" ; P=Total
+        else
+            PART="partitions=$P"
+        fi
+        data=($P)
+        [ "$P" == "allnodes" ] && continue
+        for tres in cpu mem billing; do
+            val=`sudo sreport $OPT -T $tres $PART grouping=1000  | awk '{print $3}'`
+            [ -z $val ] && break
+            [ "$tres" == "mem" ] && val=$((val/1024))
+            data+=($val)
+        done
+        [ ${#data[@]} -eq 1 ] && continue
+        if [ "$P" == "Total" ]; then
+            [ $n -ge 2 ] && printc - 50 && printf "%-10s %-12s %-12s %10s\n" ${data[@]}
+        else
+            printf "%-10s %-12s %-12s %10s\n" ${data[@]}
+            let n++
+        fi
+    done
+    printc = 50
+    exit
+}
+#======================================================================
+TEMP=$(getopt -o 'dsu:c::' --long 'details,user,sum:,c-long::' -- "$@")
+if [ $? -ne 0 ]; then
+    echo 'Terminating...' >&2
+    exit 1
+fi
+
+# Note the quotes around "$TEMP": they are essential!
+eval set -- "$TEMP"
+unset TEMP
+
+while true; do
+    case "$1" in
+        '-d'|'--details')
+            _T_=1
+            shift
+            continue
+        ;;
+            '-s'|'--sum')
+            _SUM=1
+            shift
+            continue
+        ;;
+        '-u'|'--user')
+            user=$2
+            shift 2
+            continue
+        ;;
+        '--')
+            shift
+            break
+        ;;
+        *)
+            echo 'Internal error!' >&2
+            exit 1
+        ;;
+    esac
+done
+
+if [ -z $user ]; then
+   for arg; do
+       user=$arg
+   done
+fi
+
+if ( is_uint $user ); then
+   n=${#user}
+   UU="u111111"
+   USER=${UU:: -n}$user
+elif [ ! -z $user ]; then
+   USER=$user
+fi
+( ! grep -wq ^$USER /etc/passwd ) && exit 0 || true
+#======================================================================
+Acct=(`sshare -nU -u $USER -o Account`)
+na=${#Acct[@]}
+if [ $na -eq 0 ]; then
+   [ $UID -eq `id -u $USER` ] && exit 0
+   echo "You don't have permission to ${USER}'s data!"
+   exit
+fi
+#======================================================================
+[ ! -z $_T_ ] && total_usage
+_SUM_=0
+FMT1="%-25s %-12s  %-12s %-12s\n"
+echo "================================================================"
+printf "$FMT1" "Account Credit Status:" "Total" "Used" "Available"
+printf "$FMT1" "----------------------" "-----" "----" "---------" 
+PFMT="%-25s %'-12d  %'-12d %'-12d\n"
+for a in ${Acct[@]}; do
+    compute $a
+    if (is_uint $gtm); then
+	 _SUM_=$((_SUM_+gtm))
+	 printf "$PFMT" "Account=$a" $gtm $usage $((gtm-usage))
+     else
+	 printf "$FMT1" "Account=$a" $gtm $usage $gtm
+    fi
+done
+[ ! -z $_SUM ] && echo $_SUM_
+
